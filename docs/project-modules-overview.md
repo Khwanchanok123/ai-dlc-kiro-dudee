@@ -194,5 +194,5 @@ graph LR
 
 ## เอกสารที่เกี่ยวข้อง
 
-- `docs/requirement-management-plan.md` — แผนแยก task ของ Module 01
 - `docs/team-roles-responsibilities.md` — วิเคราะห์หน้าที่ของแต่ละตำแหน่ง
+- `docs/role-checklist.md` — checklist แบ่งงาน/ตรวจงานต่อตำแหน่ง + วิธีใช้ AI-DLC จัดการงาน
