@@ -314,4 +314,4 @@ Escape Rate จะยุติธรรมได้ต้องรู้ว่�
 ## เอกสารที่เกี่ยวข้อง
 
 - `docs/project-modules-overview.md` — สรุป module ทั้งหมด
-- `docs/requirement-management-plan.md` — แผนแยก task ของ Module 01
+- `docs/role-checklist.md` — checklist แบ่งงาน/ตรวจงานต่อตำแหน่ง + วิธีใช้ AI-DLC จัดการงาน
