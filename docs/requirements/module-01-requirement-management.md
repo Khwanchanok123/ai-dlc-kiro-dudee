@@ -273,7 +273,506 @@ Draft → Approved → In Progress → Done
 
 ---
 
-## 8. เอกสารที่เกี่ยวข้อง
+## 8. Technical Design Spec (สำหรับ Dev — React + NestJS)
+
+> **วัตถุประสงค์ของหมวดนี้:** ให้ Dev implement ได้ทันทีโดยไม่ต้องรอ UX/UI mockup และไม่ต้องเดา layout, validation message, หรือ API contract เอง ("vibe code ได้ตรง spec")
+> **Stack:** Frontend = React (+ TypeScript), Backend = NestJS (+ TypeScript), DB = PostgreSQL (assumption — ปรับ ORM/DB จริงได้ถ้าโปรเจกต์กำหนดต่างจากนี้)
+
+### 8.1 Data Model (Entity)
+
+```typescript
+// requirement.entity.ts
+export enum ReqCategory {
+  FUNCTIONAL = 'FUNCTIONAL',
+  NON_FUNCTIONAL = 'NON_FUNCTIONAL',
+}
+
+export enum MoscowPriority {
+  MUST = 'MUST',
+  SHOULD = 'SHOULD',
+  COULD = 'COULD',
+  WONT = 'WONT',
+}
+
+export enum RequirementStatus {
+  DRAFT = 'DRAFT',
+  APPROVED = 'APPROVED',
+  IN_PROGRESS = 'IN_PROGRESS',
+  DONE = 'DONE',
+}
+
+export enum NfrType {
+  PERFORMANCE = 'PERFORMANCE',
+  SECURITY = 'SECURITY',
+  USABILITY = 'USABILITY',
+  RELIABILITY = 'RELIABILITY',
+  SCALABILITY = 'SCALABILITY',
+  OTHER = 'OTHER',
+}
+
+@Entity('requirements')
+export class Requirement {
+  @PrimaryGeneratedColumn('uuid')
+  id: string; // internal PK (uuid)
+
+  @Column({ unique: true })
+  code: string; // display ID เช่น "REQ-001" — generate ที่ service layer (ดู 8.4)
+
+  @Column()
+  title: string; // maxLength 200
+
+  @Column('text')
+  description: string; // maxLength 5000
+
+  @Column({ type: 'enum', enum: ReqCategory })
+  reqCategory: ReqCategory;
+
+  @Column({ type: 'enum', enum: MoscowPriority })
+  moscowPriority: MoscowPriority;
+
+  @Column({ type: 'enum', enum: RequirementStatus, default: RequirementStatus.DRAFT })
+  status: RequirementStatus;
+
+  @ManyToOne(() => Module, { nullable: false })
+  module: Module; // FK -> modules.id
+
+  @ManyToOne(() => Sprint, { nullable: false })
+  sprint: Sprint; // FK -> sprints.id
+
+  @Column('float')
+  initialEstimate: number; // > 0, unit = story point (assumption)
+
+  @Column('float', { nullable: true })
+  actualEstimate: number | null; // auto-rollup, ไม่รับจาก request body ตรง (read-only field)
+
+  // --- NFR-only fields (nullable เมื่อ reqCategory = FUNCTIONAL) ---
+  @Column({ type: 'enum', enum: NfrType, nullable: true })
+  nfrType: NfrType | null;
+
+  @Column('float', { nullable: true })
+  metricValue: number | null;
+
+  @Column({ nullable: true })
+  metricUnit: string | null; // maxLength 50
+
+  @Column('text', { nullable: true })
+  measurementCondition: string | null; // maxLength 500
+
+  @ManyToOne(() => User, { nullable: false })
+  createdBy: User;
+
+  @CreateDateColumn()
+  createdAt: Date;
+
+  @UpdateDateColumn()
+  updatedAt: Date;
+
+  @OneToMany(() => RequirementAuditLog, (log) => log.requirement)
+  auditLogs: RequirementAuditLog[];
+}
+
+@Entity('requirement_audit_logs')
+export class RequirementAuditLog {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @ManyToOne(() => Requirement, (r) => r.auditLogs)
+  requirement: Requirement;
+
+  @ManyToOne(() => User)
+  changedBy: User;
+
+  @Column()
+  fieldName: string; // เช่น "moscowPriority", "status", "sprint"
+
+  @Column('text', { nullable: true })
+  oldValue: string | null;
+
+  @Column('text', { nullable: true })
+  newValue: string | null;
+
+  @CreateDateColumn()
+  changedAt: Date;
+}
+```
+
+### 8.2 Validation Rules (NestJS `class-validator` DTO)
+
+```typescript
+// create-requirement.dto.ts
+export class CreateRequirementDto {
+  @IsString()
+  @Length(1, 200)
+  title: string;
+
+  @IsString()
+  @Length(1, 5000)
+  description: string;
+
+  @IsEnum(ReqCategory)
+  reqCategory: ReqCategory;
+
+  @IsEnum(MoscowPriority)
+  moscowPriority: MoscowPriority;
+
+  @IsUUID()
+  moduleId: string;
+
+  @IsUUID()
+  sprintId: string;
+
+  @IsNumber()
+  @Min(0.1)
+  initialEstimate: number;
+
+  // --- Conditional: บังคับเมื่อ reqCategory === NON_FUNCTIONAL ---
+  @ValidateIf((o) => o.reqCategory === ReqCategory.NON_FUNCTIONAL)
+  @IsEnum(NfrType)
+  @IsNotEmpty({ message: 'nfrType เป็นค่าที่ต้องระบุเมื่อ Req Category เป็น Non-Functional' })
+  nfrType?: NfrType;
+
+  @ValidateIf((o) => o.reqCategory === ReqCategory.NON_FUNCTIONAL)
+  @IsNumber({ message: 'Metric Value ต้องเป็นตัวเลข' })
+  @IsNotEmpty({ message: 'NFR ต้องระบุค่าตัวเลขที่วัดได้ (Metric Value)' })
+  metricValue?: number;
+
+  @ValidateIf((o) => o.reqCategory === ReqCategory.NON_FUNCTIONAL)
+  @IsString()
+  @Length(1, 50, { message: 'NFR ต้องระบุหน่วยของค่าตัวเลข (Metric Unit)' })
+  metricUnit?: string;
+
+  @ValidateIf((o) => o.reqCategory === ReqCategory.NON_FUNCTIONAL)
+  @IsString()
+  @Length(1, 500, { message: 'NFR ต้องระบุเงื่อนไขการวัด (Measurement Condition)' })
+  measurementCondition?: string;
+}
+
+// update-requirement.dto.ts
+export class UpdateRequirementDto extends PartialType(CreateRequirementDto) {}
+
+// change-status.dto.ts
+export class ChangeStatusDto {
+  @IsEnum(RequirementStatus)
+  status: RequirementStatus;
+}
+```
+
+**กฎ validation เพิ่มเติมที่ implement ที่ Service layer (ไม่ใช่ DTO decorator):**
+
+| กฎ | ที่มา | Error ที่ต้อง throw |
+|----|------|----------------------|
+| ห้าม `DELETE` เมื่อมี Task ผูกอยู่ | FR-08 | `409 Conflict` — `"ไม่สามารถลบ Requirement ที่มี Task ผูกอยู่ กรุณายกเลิกความสัมพันธ์ก่อน"` |
+| ห้ามแตก Task จาก Requirement ที่ status = `DRAFT` | FR-09 | (ตรวจใน Module 02 service — cross-module rule ระบุไว้ที่นี่เพื่อ traceability) |
+| เปลี่ยน `status` ต้องตามลำดับ `DRAFT → APPROVED → IN_PROGRESS → DONE` เท่านั้น ห้ามข้ามหรือย้อนกลับผ่าน API ตรง (IN_PROGRESS/DONE เป็น auto-only ดู 8.4) | FR-09 | `400 Bad Request` — `"ไม่สามารถเปลี่ยนสถานะจาก {current} เป็น {target} ได้"` |
+| `moduleId` / `sprintId` ต้องมีอยู่จริงใน DB | FR-07 | `404 Not Found` — `"ไม่พบ Module/Sprint ที่ระบุ"` |
+| แก้ไข field ที่อยู่ใน audit list ต้องเขียน `RequirementAuditLog` | FR-08/NFR-04 | (side-effect, ไม่ throw error) |
+
+### 8.3 REST API Contract
+
+**Base path:** `/api/v1/requirements`
+**Auth:** ทุก endpoint ต้องมี `Authorization: Bearer <JWT>` — ปฏิเสธด้วย `401 Unauthorized` ถ้าไม่มี/หมดอายุ (รายละเอียด role-based guard ดู 8.3.1)
+
+| # | Method | Path | คำอธิบาย | Role ที่เรียกได้ |
+|---|--------|------|----------|-------------------|
+| 1 | `GET` | `/api/v1/requirements` | รายการ Requirement พร้อม filter/pagination | SA, PM, UX, Dev, Tester (read) |
+| 2 | `GET` | `/api/v1/requirements/:id` | ดู Requirement เดี่ยว พร้อม linked Task/Defect | SA, PM, UX, Dev, Tester (read) |
+| 3 | `POST` | `/api/v1/requirements` | สร้าง Requirement ใหม่ | SA |
+| 4 | `PATCH` | `/api/v1/requirements/:id` | แก้ไข Requirement | SA, PM |
+| 5 | `PATCH` | `/api/v1/requirements/:id/status` | เปลี่ยนสถานะ (manual transition เท่านั้น) | SA, PM |
+| 6 | `DELETE` | `/api/v1/requirements/:id` | ลบ Requirement (เฉพาะที่ไม่มี Task ผูก) | SA |
+| 7 | `GET` | `/api/v1/requirements/:id/audit-logs` | ดู audit log ของ Requirement | SA, PM |
+
+#### 8.3.1 Role Guard
+
+```typescript
+// ใช้ NestJS Guard + Decorator
+@Roles('SA')
+@Post()
+create(@Body() dto: CreateRequirementDto) { ... }
+
+@Roles('SA', 'PM')
+@Patch(':id')
+update(@Param('id') id: string, @Body() dto: UpdateRequirementDto) { ... }
+```
+ถ้า role ไม่ตรง → `403 Forbidden`, body: `{ "message": "คุณไม่มีสิทธิ์ทำรายการนี้" }`
+
+#### 8.3.2 `GET /api/v1/requirements`
+
+**Query params:**
+
+| Param | ประเภท | Default | คำอธิบาย |
+|-------|--------|---------|----------|
+| `page` | number | 1 | เลขหน้า |
+| `pageSize` | number | 20 | จำนวนต่อหน้า (max 100) |
+| `reqCategory` | enum | — | filter ตาม category |
+| `status` | enum | — | filter ตาม status |
+| `moduleId` | uuid | — | filter ตาม module |
+| `sprintId` | uuid | — | filter ตาม sprint |
+| `search` | string | — | ค้นหาใน `title`/`description` (ILIKE) |
+
+**Response `200 OK`:**
+```json
+{
+  "data": [
+    {
+      "id": "a1b2c3d4-...",
+      "code": "REQ-001",
+      "title": "ผู้ใช้ต้องสามารถ login ด้วยอีเมลและรหัสผ่านได้",
+      "reqCategory": "FUNCTIONAL",
+      "moscowPriority": "MUST",
+      "status": "DRAFT",
+      "module": { "id": "...", "name": "Module 02 - Task Management" },
+      "sprint": { "id": "...", "name": "Sprint 3" },
+      "initialEstimate": 5,
+      "actualEstimate": null,
+      "createdAt": "2026-08-20T04:00:00.000Z"
+    }
+  ],
+  "meta": { "page": 1, "pageSize": 20, "totalItems": 42, "totalPages": 3 }
+}
+```
+
+#### 8.3.3 `POST /api/v1/requirements`
+
+**Request body (Functional):**
+```json
+{
+  "title": "ผู้ใช้ต้องสามารถ login ด้วยอีเมลและรหัสผ่านได้",
+  "description": "หน้า login ต้องรองรับ email + password พร้อม validation",
+  "reqCategory": "FUNCTIONAL",
+  "moscowPriority": "MUST",
+  "moduleId": "b2c3d4e5-...",
+  "sprintId": "c3d4e5f6-...",
+  "initialEstimate": 5
+}
+```
+
+**Request body (Non-Functional):**
+```json
+{
+  "title": "หน้า Dashboard ต้องโหลดเร็ว",
+  "description": "โหลดข้อมูล dashboard สำหรับผู้ใช้ทั่วไป",
+  "reqCategory": "NON_FUNCTIONAL",
+  "moscowPriority": "MUST",
+  "moduleId": "b2c3d4e5-...",
+  "sprintId": "c3d4e5f6-...",
+  "initialEstimate": 8,
+  "nfrType": "PERFORMANCE",
+  "metricValue": 2,
+  "metricUnit": "seconds",
+  "measurementCondition": "ที่ 100 concurrent users"
+}
+```
+
+**Response `201 Created`:** object เดียวกับ item ใน 8.3.2 พร้อม `code` ที่ generate อัตโนมัติ
+
+**Response `400 Bad Request`** (validation fail):
+```json
+{
+  "statusCode": 400,
+  "message": [
+    "NFR ต้องระบุค่าตัวเลขที่วัดได้ (Metric Value)",
+    "NFR ต้องระบุหน่วยของค่าตัวเลข (Metric Unit)"
+  ],
+  "error": "Bad Request"
+}
+```
+
+#### 8.3.4 `PATCH /api/v1/requirements/:id/status`
+
+**Request:**
+```json
+{ "status": "APPROVED" }
+```
+
+**Response `200 OK`:** Requirement object พร้อม status ใหม่
+**Response `400 Bad Request`:** `{ "statusCode": 400, "message": "ไม่สามารถเปลี่ยนสถานะจาก DRAFT เป็น DONE ได้" }`
+
+#### 8.3.5 `DELETE /api/v1/requirements/:id`
+
+**Response `204 No Content`:** ลบสำเร็จ
+**Response `409 Conflict`:**
+```json
+{
+  "statusCode": 409,
+  "message": "ไม่สามารถลบ Requirement ที่มี Task ผูกอยู่ กรุณายกเลิกความสัมพันธ์ก่อน",
+  "linkedTaskCount": 3
+}
+```
+
+#### 8.3.6 Error Response มาตรฐาน (ใช้ทุก endpoint)
+
+```json
+{
+  "statusCode": 404,
+  "message": "ไม่พบ Requirement ที่ระบุ",
+  "error": "Not Found"
+}
+```
+
+| HTTP Code | กรณี |
+|-----------|------|
+| `400` | Validation error (DTO หรือ business rule) |
+| `401` | ไม่มี/หมดอายุ JWT token |
+| `403` | Role ไม่มีสิทธิ์ |
+| `404` | ไม่พบ resource (`id`, `moduleId`, `sprintId`) |
+| `409` | Conflict (ลบ Requirement ที่มี Task ผูก, status transition ผิดลำดับ) |
+| `500` | Unhandled server error — ต้อง log แต่ห้าม leak stack trace ให้ client |
+
+---
+
+### 8.4 Business Logic ที่ต้อง Implement ที่ Service Layer
+
+1. **Code generation:** `code` field generate จาก sequence ต่อจากตัวล่าสุดในระบบ format `REQ-{n}` โดย `n` เป็นเลข 3 หลักขึ้นไป zero-padded (เช่น `REQ-001`, `REQ-042`, `REQ-1024`) — ใช้ DB sequence หรือ `SELECT COUNT(*) + 1` ภายใน transaction เพื่อป้องกัน race condition
+2. **Actual Estimate rollup:** เมื่อ Task (Module 02) ที่ผูกกับ Requirement เปลี่ยนสถานะเป็น `DONE` พร้อม `actualHours`, ต้อง trigger การ re-sum `actualEstimate` ของ Requirement นั้น (event-driven ผ่าน NestJS `EventEmitter` หรือ message queue — ไม่ implement เป็น cron poll)
+3. **Auto status transition:**
+   - เมื่อ Task แรกที่ผูกกับ Requirement เปลี่ยนเป็น "กำลังทำ" → emit event ให้ Requirement service เปลี่ยน status เป็น `IN_PROGRESS` (เฉพาะกรณีปัจจุบันเป็น `APPROVED`)
+   - เมื่อ Task ทั้งหมดที่ผูกกับ Requirement เป็น `DONE` → เปลี่ยน Requirement เป็น `DONE`
+   - Manual `PATCH /status` เปลี่ยนได้เฉพาะ `DRAFT → APPROVED` เท่านั้น (transition อื่นเป็น auto-only ตามด้านบน) — ถ้า client พยายาม `PATCH` ไปเป็น `IN_PROGRESS`/`DONE` ตรง ให้ตอบ `400`
+4. **Audit log write:** ทุกครั้งที่ `PATCH` เปลี่ยนค่า `moscowPriority`, `status`, หรือ `sprintId` ให้ insert record ใน `requirement_audit_logs` ภายใน transaction เดียวกับการ update (ไม่ fire-and-forget)
+5. **Delete guard:** ก่อนลบ ต้อง query จำนวน Task ที่ `requirementId = :id` ก่อนเสมอ ถ้า count > 0 ให้ throw `ConflictException` ทันที ไม่ลบ
+
+---
+
+### 8.5 Frontend Wireframes (React)
+
+> Component library: ไม่ fix (assumption: MUI หรือ Ant Design ก็ map ได้ตรงกับ spec นี้) — ระบุ "ชนิด component" ที่ต้องใช้ต่อ field ให้ Dev เลือก component จริงจาก library ที่โปรเจกต์ใช้
+
+#### 8.5.1 หน้า List — `/requirements`
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Requirement Management                              [+ New Requirement]│ <- Button (primary)
+├─────────────────────────────────────────────────────────────────────────┤
+│  [Search box...............]  [Category ▾] [Status ▾] [Module ▾] [Sprint ▾] │
+│   ^TextInput (debounce 400ms)  ^Select      ^Select    ^Select    ^Select │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Code    │ Title              │ Category │ Priority │ Status    │ Module │
+├──────────┼─────────────────────┼──────────┼──────────┼───────────┼────────┤
+│  REQ-001 │ Login ด้วยอีเมล...  │ Function │ Must     │ 🟡 Draft  │ M02   │ <- Row คลิกได้ → ไป Detail
+│  REQ-002 │ Dashboard ต้องโหลด..│ Non-Func │ Must     │ 🟢 Approv │ M04   │
+│  ...     │ ...                 │ ...      │ ...      │ ...       │ ...    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                         [< Prev]  Page 1 of 3  [Next >]                 │ <- Pagination component
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Component/behavior spec:**
+
+| Element | Component ชนิด | Behavior |
+|---------|-----------------|----------|
+| Search box | Text Input พร้อม debounce | ยิง `GET ?search=` ทุก 400ms หลังหยุดพิมพ์ |
+| Category filter | Select (single) | ค่า: All / Functional / Non-Functional |
+| Status filter | Select (single) | ค่า: All / Draft / Approved / In Progress / Done |
+| Module filter | Select (single, async load options จาก `GET /api/v1/modules`) | — |
+| Sprint filter | Select (single, async load options จาก `GET /api/v1/sprints`) | — |
+| Status badge | Colored badge/chip | Draft=เทา, Approved=เขียวอ่อน, In Progress=น้ำเงิน, Done=เขียว |
+| Table row | Clickable row | คลิก → navigate ไป `/requirements/:id` |
+| "New Requirement" button | Button (primary) | แสดงเฉพาะเมื่อ `currentUser.role === 'SA'` — ซ่อนถ้าไม่ใช่ |
+| Pagination | Pagination component | sync กับ query param `page` |
+| Loading state | Skeleton rows (5 แถว) | แสดงระหว่างรอ API response |
+| Empty state | ข้อความ "ยังไม่มี Requirement — เริ่มสร้างรายการแรก" + ปุ่ม New (ถ้า role = SA) | แสดงเมื่อ `data.length === 0` |
+
+#### 8.5.2 หน้า Create/Edit Form — `/requirements/new`, `/requirements/:id/edit`
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ← Back            New Requirement / Edit REQ-001                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Title *                                                                 │
+│  [_____________________________________________________________]       │ <- TextInput, maxLength=200
+│                                                                           │
+│  Description *                                                          │
+│  [_____________________________________________________________]       │
+│  [_____________________________________________________________]       │ <- TextArea (multiline), maxLength=5000
+│                                                                           │
+│  Req Category *              MoSCoW Priority *                          │
+│  ( ) Functional               [Must ▾]                                  │ <- RadioGroup          Select (single)
+│  (•) Non-Functional                                                     │
+│                                                                           │
+│  ┌─ NFR Fields (แสดงเฉพาะเมื่อ Category = Non-Functional) ──────────┐  │
+│  │  NFR Type *          Metric Value *      Metric Unit *           │  │
+│  │  [Performance ▾]     [____2____]          [seconds_______]       │  │ <- Select    NumberInput   TextInput
+│  │                                                                    │  │
+│  │  Measurement Condition *                                          │  │
+│  │  [ที่ 100 concurrent users_______________________________]      │  │ <- TextInput
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  Module *                    Sprint *                                  │
+│  [Module 04 - Sprint Mgmt ▾]  [Sprint 3 ▾]                              │ <- Select(async)      Select(async)
+│                                                                           │
+│  Initial Estimate (story point) *                                       │
+│  [___5___]                                                              │ <- NumberInput, min=0.1, step=0.5
+│                                                                           │
+│                                          [Cancel]        [Save]          │ <- Button(text)  Button(primary, submit)
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Component/behavior spec:**
+
+| Field | Component ชนิด | Validation แสดงผล (inline, ใต้ field) |
+|-------|-----------------|----------------------------------------|
+| Title | Text Input | required — `"กรุณาระบุชื่อ Requirement"`; maxLength exceeded — `"ต้องไม่เกิน 200 ตัวอักษร"` |
+| Description | Text Area (multiline, 4 แถว) | required — `"กรุณาระบุรายละเอียด"` |
+| Req Category | Radio Group (2 ตัวเลือก) | required, default ยังไม่เลือกอะไร |
+| MoSCoW Priority | Select (single, 4 ตัวเลือก) | required — `"กรุณาเลือก Priority"` |
+| NFR Type | Select (single, 6 ตัวเลือก) | **แสดง/ซ่อนตาม Req Category** — required เมื่อแสดง |
+| Metric Value | Number Input | required เมื่อ NFR แสดง — `"NFR ต้องระบุค่าตัวเลขที่วัดได้"`; ห้ามใส่ตัวอักษร |
+| Metric Unit | Text Input | required เมื่อ NFR แสดง — `"NFR ต้องระบุหน่วยของค่าตัวเลข"` |
+| Measurement Condition | Text Input | required เมื่อ NFR แสดง — `"NFR ต้องระบุเงื่อนไขการวัด"` |
+| Module | Select (single, async, searchable) | required — โหลด options จาก `GET /api/v1/modules` |
+| Sprint | Select (single, async, searchable) | required — โหลด options จาก `GET /api/v1/sprints` |
+| Initial Estimate | Number Input | required, min 0.1 — `"ค่าประมาณต้องมากกว่า 0"` |
+| Save button | Button (primary, type=submit) | disabled ระหว่างรอ API response (แสดง spinner ในปุ่ม); เมื่อ API ตอบ `400` ให้ map error message ไปแสดงใต้ field ที่ตรงกับ key ใน response |
+| Cancel button | Button (text/secondary) | navigate กลับหน้า list โดยไม่บันทึก — ถ้ามีการแก้ไขค่าแล้วให้ confirm dialog `"ยกเลิกการแก้ไข? การเปลี่ยนแปลงจะไม่ถูกบันทึก"` |
+
+**Conditional rendering logic (React):**
+```
+NFR fields block แสดงเมื่อ: watch('reqCategory') === 'NON_FUNCTIONAL'
+เมื่อสลับจาก Non-Functional -> Functional: clear ค่า nfrType/metricValue/metricUnit/measurementCondition ทิ้ง ก่อน submit
+```
+
+#### 8.5.3 หน้า Detail — `/requirements/:id`
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ← Back        REQ-001 — Login ด้วยอีเมล...          [Edit] [Delete]    │ <- ปุ่มแสดงเฉพาะ role SA (Edit: SA,PM)
+├─────────────────────────────────────────────────────────────────────────┤
+│  Status: 🟡 Draft     [Approve →]                                       │ <- ปุ่ม Approve แสดงเมื่อ status=DRAFT และ role SA/PM
+│  Category: Functional        Priority: Must                            │
+│  Module: M02 - Task Mgmt     Sprint: Sprint 3                          │
+│  Initial Estimate: 5 pts     Actual Estimate: — (ยังไม่มี Task)         │
+│                                                                           │
+│  Description:                                                           │
+│  หน้า login ต้องรองรับ email + password พร้อม validation                │
+│                                                                           │
+│  ── Linked Tasks (2) ──────────────────────────────────────────────────  │
+│  │ TASK-014 │ Implement login API      │ Dev: สมชาย │ 🟢 Done         │
+│  │ TASK-015 │ Login form UI            │ Dev: สมหญิง│ 🔵 In Progress  │
+│                                                                           │
+│  ── Linked Defects (0) ────────────────────────────────────────────────  │
+│  (ไม่มี Defect ที่เกี่ยวข้อง)                                            │
+│                                                                           │
+│  ── Audit Log ──────────────────────────────────────────────────────────│
+│  │ 2026-08-19 10:00 │ สมศักดิ์ (SA) │ สร้าง Requirement                │
+│  │ 2026-08-20 09:00 │ พีระ (PM)     │ moscowPriority: Should → Must     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Component/behavior spec:**
+
+| Element | Component ชนิด | Behavior |
+|---------|-----------------|----------|
+| Edit button | Button | แสดงเมื่อ `role in ['SA','PM']` — navigate ไป `/requirements/:id/edit` |
+| Delete button | Button (danger) | แสดงเมื่อ `role === 'SA'` — เปิด confirm dialog ก่อนเรียก `DELETE`; ถ้า API ตอบ `409` ให้แสดง dialog แจ้ง `"มี Task ผูกอยู่ {n} รายการ ไม่สามารถลบได้"` |
+| Approve button | Button (primary) | แสดงเมื่อ `status === 'DRAFT'` และ `role in ['SA','PM']` — เรียก `PATCH /status` body `{status:'APPROVED'}` |
+| Linked Tasks table | Table (read-only) | ดึงจาก response ของ `GET /:id` field `tasks[]`; แถวคลิกได้ไปหน้า Task detail (Module 02) |
+| Linked Defects table | Table (read-only) | เหมือนกัน field `defects[]`; ถ้า array ว่างแสดง empty state text |
+| Audit Log list | Timeline/List (read-only) | ดึงจาก `GET /:id/audit-logs`, format `oldValue → newValue` |
+
+---
+
+## 9. เอกสารที่เกี่ยวข้อง
 
 - `docs/project-modules-overview.md` — ภาพรวม 8 Modules และความเชื่อมโยง
 - `docs/team-roles-responsibilities.md` — บทบาทและ KPI ของแต่ละ role
